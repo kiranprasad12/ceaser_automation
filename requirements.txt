@@ -1,0 +1,5 @@
+pymupdf
+rapidocr-onnxruntime
+pillow
+numpy
+openpyxl
