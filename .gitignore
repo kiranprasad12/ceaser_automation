@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+iso2cii_db_path.txt
+iso2cii_error.txt
+*.review.json
+*.check.png
