@@ -1,0 +1,15 @@
+# Python packages for iso2cii.py (Python 3.9 or newer)
+# Install:  pip install -r requirements.txt
+
+# reads the vector lines and text of the PDF
+pymupdf>=1.24
+# offline OCR for the dimension numbers (no API key, no internet needed)
+rapidocr-onnxruntime>=1.2.3
+# image handling for the OCR crops and the check picture
+pillow>=10.0
+numpy>=1.24
+# reads the Excel line list (temperature and pressure)
+openpyxl>=3.1
+
+# Not installed with pip: tkinter (file windows). It comes with the standard Python
+# installer for Windows and macOS. On Linux: sudo apt install python3-tk
