@@ -151,6 +151,18 @@ Other things to know:
 | No dimension found for a leg | Add the numbers by hand in the review JSON and use `--from-json`. |
 | CAESAR II shows an error | Note the section name and line number in the message. |
 
+## Several sheets that continue into each other
+
+Choose all the sheets together (hold Ctrl in the file window), give several PDF names, or give a folder. The sheets do NOT need the same line number.
+
+- The tool reads each sheet, then joins the sheets whose pipes continue into each other: the "CONT'D ON" point of one sheet is the "CONT'D FROM" point of the next (within 400 mm). A sheet that runs the other way is turned round, but only if the points match within 20 mm.
+- Sheets that are not connected to any other are written as their own files, as before.
+- A joined result is ONE file, for example `6-CH-33804-B52-NI+6-RJ-33811-B52-NI_merged.CII`, with continuous node numbers and one check picture per sheet (`..._sheet1.check.png`, ...).
+- Each sheet keeps its own line number, pipe size, wall thickness, bend radius and, with the Excel list, its own temperature and pressure. The line number is written on the first element of each sheet.
+- If the join has a gap (a dimension missing on a sheet), a straight connecting element is added and a warning gives its length. Check it.
+- Sheets with only a bill of materials are skipped. A sheet that fails (for example a tee in the main pipe) is reported and the other sheets still run.
+- Two sheets that end at the same point are joined by turning one round. This is right when they meet end to end. If they are two branches meeting at a tee, check the result.
+
 ## Line thickness
 
 The tool groups the stroke widths on the sheet and takes as pipe the widest group that forms a clear isometric-angled network. A thicker title block or a dark marker is no longer taken as pipe. Thinner lines that start at the pipe are outlets, and the rest are dimensions. If all widths are about the same it falls back to reading the picture, which is less reliable.

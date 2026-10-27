@@ -1555,6 +1555,25 @@ def get_pipe_data(model, warn):
     return od, wall
 
 
+def _leg_extra(lg, R, first=True):
+    d = {'R': lg.get('R_mm') or R}
+    if first and lg.get('line'):
+        d['line'] = lg['line']
+    if lg.get('od_mm'):
+        d['od'], d['wall'] = lg['od_mm'], lg['wall_mm']
+    if lg.get('process'):
+        d['proc'] = lg['process']
+    return d
+
+
+def _turns(a, b):
+    """True when leg b does not continue straight on from leg a (so there is a bend, not a plain join)"""
+    if a.get('gap') or b.get('gap'):
+        return False
+    ua, ub = _leg_unit(a), _leg_unit(b)
+    return sum(x * y for x, y in zip(ua, ub)) < 0.9999
+
+
 def _leg_unit(lg):
     """direction of a leg as a unit vector (East, Up, North)"""
     if lg.get('comp'):
@@ -1574,10 +1593,14 @@ def fit_bends(legs, R, warn):
     neighbour and the model looks wrong. Such a node is dropped (its piece is joined to the next one)."""
     legs = [dict(l, parts=list(l.get('parts') or [])) for l in legs]
     for i in range(len(legs) - 1):
+        if legs[i].get('gap') or legs[i + 1].get('gap'):
+            continue
         a, b = _leg_unit(legs[i]), _leg_unit(legs[i + 1])
         cosd = max(-1.0, min(1.0, sum(x * y for x, y in zip(a, b))))
         delta = math.acos(cosd)                       # change of direction at the corner
-        T = R * math.tan(delta / 2.0) if delta < math.radians(179) else 0.0
+        R_i = float(legs[i].get('R_mm') or R)
+        R_j = float(legs[i + 1].get('R_mm') or R)
+        T = max(R_i, R_j) * math.tan(delta / 2.0) if delta < math.radians(179) else 0.0
         if T <= 1:
             continue
         for k, (lg, last) in enumerate(((legs[i], True), (legs[i + 1], False))):
@@ -1680,8 +1703,10 @@ def build_cii(model, z_is_north=False, warn=print):
                 vy += DIR_VEC[d_][1] * float(v_)
                 vz += DIR_VEC[d_][2] * float(v_)
             vy += float(lg.get('dy_mm', 0))
-            elems.append({'f': node, 't': node + NODE_STEP, 'dx': vx, 'dy': vy,
-                          'dz': vz * (1 if z_is_north else -1), 'bend': li < len(legs) - 1})
+            elems.append(dict({'f': node, 't': node + NODE_STEP, 'dx': vx, 'dy': vy,
+                               'dz': vz * (1 if z_is_north else -1),
+                               'bend': li < len(legs) - 1 and _turns(lg, legs[li + 1])},
+                              **_leg_extra(lg, R, True)))
             node += NODE_STEP
             continue
         vec = DIR_VEC[lg['dir']]
@@ -1692,18 +1717,19 @@ def build_cii(model, z_is_north=False, warn=print):
             tot_leg = float(sum(lg['parts']))
             dy = vec[1] * p + (float(lg.get('dy_mm', 0)) * p / tot_leg if tot_leg else 0.0)
             dz = vec[2] * p * (1 if z_is_north else -1)
-            elems.append({'f': node, 't': node + NODE_STEP, 'dx': dx, 'dy': dy, 'dz': dz,
-                          'bend': last and li < len(legs) - 1})
+            elems.append(dict({'f': node, 't': node + NODE_STEP, 'dx': dx, 'dy': dy, 'dz': dz,
+                               'bend': last and li < len(legs) - 1 and _turns(lg, legs[li + 1])},
+                              **_leg_extra(lg, R, pi == 0)))
             node += NODE_STEP
         if '_bounds' in lg:
-            for oi, (li_, bv, Lv) in host_node.items():
-                if li_ == li and not isinstance(host_node[oi][1], int):
+            for oi, hv_ in list(host_node.items()):
+                li_, bv, Lv = hv_[0], hv_[1], hv_[2]
+                if len(hv_) == 3 and li_ == li:
                     k_ = min(range(len(lg['_bounds'])), key=lambda k: abs(lg['_bounds'][k] - bv))
                     host_node[oi] = (li_, int(leg_first + k_ * NODE_STEP), Lv, True)
     n_main = len(elems)
     out_el = []
     if outlets and host_node:
-        od2, wall2 = get_pipe_data({'nps': model.get('outlet_nps'), 'schedule': model.get('outlet_schedule')}, warn)
         nn_ = node + NODE_STEP
         for oi in sorted(host_node):
             hv = host_node[oi]
@@ -1711,8 +1737,11 @@ def build_cii(model, z_is_north=False, warn=print):
                 continue
             dv = DIR_VEC[outlets[oi]['dir']]
             Lv = hv[2]
+            od2, wall2 = get_pipe_data({'nps': outlets[oi].get('nps', model.get('outlet_nps')),
+                                        'schedule': outlets[oi].get('sch', model.get('outlet_schedule'))}, warn)
             out_el.append({'f': hv[1], 't': nn_, 'dx': dv[0] * Lv, 'dy': dv[1] * Lv, 'dz': dv[2] * Lv * zsg,
-                           'bend': False, 'od': od2, 'wall': wall2})
+                           'bend': False, 'od': od2, 'wall': wall2, 'R': R,
+                           **({'proc': legs[hv[0]]['process']} if legs[hv[0]].get('process') else {})})
             nn_ += NODE_STEP
         if out_el:
             model['outlet_report'] = [(outlets[oi]['dir'], round(host_node[oi][2], 1), host_node[oi][1])
@@ -1744,15 +1773,16 @@ def build_cii(model, z_is_north=False, warn=print):
                     fmt_num(e['dz']), fmt_num(od)])
         b[0] = row([('%d.0' % e['f']), ('%d.0' % e['t']), fmt_num(e['dx']), fmt_num(e['dy']),
                     fmt_num(e['dz']), fmt_num(e.get('od', od))])
-        pr = model.get('process') or {}
+        pr = e.get('proc') or model.get('process') or {}
         tt = [fmt_num(v) if v else '0.000000' for v in (list(pr.get('temps') or []) + [0.0] * 9)[:9]]
         pp = [fmt_num(v) if v else '0.000000' for v in (list(pr.get('press') or []) + [0.0] * 9)[:9]]
         b[1] = row([fmt_num(e.get('wall', wall)), '0.000000', '0.000000'] + tt[:3])
         b[2] = row(tt[3:9])
         b[3] = row(pp[:6])
         b[4] = row(pp[6:9] + ['0.000000'] * 3)
-        if k == 0 and line_no:
-            b[10] = str(len(line_no)).rjust(12) + ' ' + line_no
+        lt_ = e.get('line') or (line_no if k == 0 else '')
+        if lt_:
+            b[10] = str(len(lt_)).rjust(12) + ' ' + lt_
         if e['bend']:
             bi += 1
             b[12] = row([bi, 0, 0, 0, 0, 0])
@@ -1764,8 +1794,8 @@ def build_cii(model, z_is_north=False, warn=print):
     for e in elems:
         if e['bend']:
             nn = e['t']
-            out.append(row([fmt_num(R), '0.000000', '-2.0202', '%d.0' % (nn - 1), '0.000000', '%d.0' % (nn - 2)]))
-            out.append(row(['0.000000', '0.000000', '0.000000', fmt_num(wall), '0.000000', '0.000000']))
+            out.append(row([fmt_num(e.get('R', R)), '0.000000', '-2.0202', '%d.0' % (nn - 1), '0.000000', '%d.0' % (nn - 2)]))
+            out.append(row(['0.000000', '0.000000', '0.000000', fmt_num(e.get('wall', wall)), '0.000000', '0.000000']))
             out.append(row(['0.000000', '0.000000']))
     out += ['#$ RIGID   ', '#$ EXPJT   ', '#$ RESTRANT', '#$ DISPLMNT', '#$ FORCMNT ', '#$ UNIFORM ',
             '#$ WIND    ', '#$ OFFSETS ']
@@ -2144,6 +2174,7 @@ def analyse_pdf(args, log, warn):
                 warn('An outlet has no OPEN END note with coordinates. Skipped.')
                 continue
             outl.append({'leg': bi_, 't': round(bt_, 4), 'dir': plan_dir_name(o['phi'], args.north),
+                         'nps': onps, 'sch': model['outlet_schedule'],
                          'note': {'E': nt['E'], 'S_letter': nt['S_letter'], 'S': nt['S'], 'EL': nt['EL']},
                          'attach': o['attach'], 'free': o['free']})
         model['outlets'] = outl
@@ -2408,9 +2439,213 @@ def ask_save_location(default_dir):
     return ans or default_dir
 
 
+
+# --------------------------------------------------------------------------
+# several sheets of one line (continuation sheets)
+# --------------------------------------------------------------------------
+class JoinError(ConvertError):
+    pass
+
+
+def sheet_key(path):
+    """'4-RJ-33812-B52-NI-1-Model.pdf' -> ('4-RJ-33812-B52-NI', 1): sheets of one line share the key"""
+    n = os.path.splitext(os.path.basename(path))[0]
+    n = re.sub(r'[-_ ]?Model$', '', n, flags=re.I)
+    m = re.fullmatch(r'(.*?)[-_ ](\d{1,2})', n)
+    if m and re.search(r'[A-Za-z]\d*-?[A-Za-z]*$', m.group(1)) and re.search(r'\d{4,}', m.group(1)):
+        return m.group(1), int(m.group(2))
+    return n, 0
+
+
+_OPP = {'N': 'S', 'S': 'N', 'E': 'W', 'W': 'E', 'U': 'D', 'D': 'U'}
+
+
+def _note_pt(d):
+    """{'E','S' or 'N','EL'} -> (E, EL, North)"""
+    north = float(d['N']) if 'N' in d else -float(d.get('S', 0.0))
+    return (float(d['E']), float(d['EL']), north)
+
+
+def _sheet_ends(model, z_is_north):
+    """start and end point (E, EL, North) of a sheet, the end computed from its legs"""
+    st = _note_pt(model.get('start') or {'E': 0, 'S': 0, 'EL': 0})
+    m = dict(model, outlets=[], outlets_found=0)
+    _, _, table, _, _, _ = build_cii(m, z_is_north, lambda x: None)
+    _, x, y, z = table[-1]
+    return st, (x, y, z if z_is_north else -z)
+
+
+def reverse_sheet(sh, z_is_north):
+    m = sh['model']
+    if any(l.get('comp') for l in m['legs']):
+        return False
+    n = len(m['legs'])
+    st, en = _sheet_ends(m, z_is_north)
+    m['legs'] = [dict(l, dir=_OPP[l['dir']], parts=list(reversed(l['parts'])),
+                      dy_mm=-float(l.get('dy_mm', 0)) if l.get('dy_mm') else 0)
+                 for l in reversed(m['legs'])]
+    for o in m.get('outlets') or []:
+        o['leg'] = n - 1 - o['leg']
+    m['start'] = {'E': en[0], 'N': en[2], 'EL': en[1]}
+    sh['reversed'] = not sh.get('reversed', False)
+    return True
+
+
+def read_sheets(args, pdfs, log, warn):
+    """Read every chosen PDF on its own. A sheet that fails keeps its error text."""
+    import copy
+    sheets = []
+    for p in pdfs:
+        nm = os.path.basename(p)
+        if len(pdfs) > 1:
+            log('\n=== Sheet %s ===' % nm)
+        a = copy.copy(args)
+        a.pdf = p
+        sh = {'pdf': p, 'name': nm}
+        try:
+            model, report, legs_geo, ctx, endx = analyse_pdf(a, log, warn)
+        except ConvertError as ex:
+            sh['error'] = str(ex)
+            sheets.append(sh)
+            continue
+        sh.update({'model': model, 'report': report, 'geo': legs_geo, 'ctx': ctx, 'end': endx})
+        sh['bad'] = [i + 1 for i, l in enumerate(model['legs'])
+                     if (l.get('comp') and any(float(v) <= 0 for _, v in l['comp'])) or
+                     (not l.get('comp') and (not l['parts'] or any(float(q) <= 0 for q in l['parts'])))]
+        sheets.append(sh)
+    return sheets
+
+
+def chain_sheets(sheets, zn, log, warn):
+    """Join sheets whose pipes continue into each other (the end point of one is the start point of the next),
+    whatever their line numbers are. Returns a list of chains (lists of sheets, in order)."""
+    items = [s_ for s_ in sheets if 'model' in s_ and not s_['bad']]
+    chains = [[s_] for s_ in items]
+
+    def dist(a, b):
+        return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+
+    def ends(ch):
+        return _sheet_ends(ch[0]['model'], zn)[0], _sheet_ends(ch[-1]['model'], zn)[1]
+
+    def rev_chain(ch):
+        for sh in ch:
+            if not reverse_sheet(sh, zn):
+                return None
+        return list(reversed(ch))
+
+    while len(chains) > 1:
+        best = None
+        for i, A in enumerate(chains):
+            for j, B in enumerate(chains):
+                if i == j:
+                    continue
+                sa, ea = ends(A)
+                sb, eb = ends(B)
+                for ra in (False, True):
+                    for rb in (False, True):
+                        # the end of A (turned round if ra) meets the start of B (turned round if rb)
+                        a_head, a_tail = (ea, sa) if ra else (sa, ea)
+                        b_head, b_tail = (eb, sb) if rb else (sb, eb)
+                        d = dist(a_tail, b_head)
+                        lim = 400 if not (ra or rb) else 20      # turning a sheet round needs an exact join
+                        if d > lim or dist(a_head, b_tail) < 150:
+                            continue
+                        if (ra or rb) and any(l.get('comp') for c_ in ((A if ra else []) + (B if rb else []))
+                                              for l in c_['model']['legs']):
+                            continue
+                        if best is None or (d + (50 if (ra or rb) else 0)) < best[0]:
+                            best = (d + (50 if (ra or rb) else 0), i, j, ra, rb)
+        if best is None:
+            break
+        _, i, j, ra, rb = best
+        A, B = chains[i], chains[j]
+        if ra:
+            A = rev_chain(A)
+        if rb:
+            B = rev_chain(B)
+        for sh in (A if ra else []) + (B if rb else []):
+            warn('Sheet %s runs against the order of the line, so it was turned round.' % sh['name'])
+        chains[i] = A + B
+        del chains[j]
+    return chains
+
+
+def merge_chain(args, chain, base, log, warn):
+    """Put the sheets of one chain into ONE model. Lines with different line numbers are kept apart per leg."""
+    zn = args.z_is_north
+    log('\nOrder of the sheets: %s' % ' -> '.join(s_['name'] for s_ in chain))
+    legs, outlets, report, sizes = [], [], [], []
+    for sh in chain:
+        try:
+            sizes.append(get_pipe_data(sh['model'], lambda x: None))
+        except ConvertError as ex:
+            raise ConvertError('Sheet %s: %s' % (sh['name'], ex))
+    mixed = len(set(sizes)) > 1
+    for k, sh in enumerate(chain):
+        m = sh['model']
+        if k > 0:
+            en_prev = _sheet_ends(chain[k - 1]['model'], zn)[1]
+            st_here = _sheet_ends(m, zn)[0]
+            gv = tuple(b - a for a, b in zip(en_prev, st_here))
+            hyp = math.sqrt(sum(v * v for v in gv))
+            if hyp > 5:
+                names = [(('E' if gv[0] > 0 else 'W'), abs(gv[0])), (('U' if gv[1] > 0 else 'D'), abs(gv[1])),
+                         (('N' if gv[2] > 0 else 'S'), abs(gv[2]))]
+                comp = [[d_, round(v_, 1)] for d_, v_ in names if v_ > 1]
+                legs.append({'dir': '+'.join(d_ for d_, _ in comp), 'parts': [round(hyp, 1)], 'comp': comp, 'gap': True,
+                             'R_mm': m.get('bend_radius_mm')})
+                warn('Between %s and %s the pipe is %.0f mm short (a dimension is missing on the first sheet). '
+                     'A straight connecting element of %.0f mm was added so the second sheet stays at its true position.'
+                     % (chain[k - 1]['name'], sh['name'], hyp, hyp))
+        off = len(legs)
+        for li_, l in enumerate(m['legs']):
+            l = dict(l)
+            if mixed:
+                l['od_mm'], l['wall_mm'] = sizes[k]
+            l['ln'] = m.get('line_number') or ''
+            if li_ == 0:
+                l['line'] = m.get('line_number') or ''
+            l['R_mm'] = m.get('bend_radius_mm')
+            legs.append(l)
+        for o in m.get('outlets') or []:
+            o = dict(o)
+            o['leg'] = o['leg'] + off
+            o.setdefault('nps', m.get('outlet_nps'))
+            o.setdefault('sch', m.get('outlet_schedule'))
+            outlets.append(o)
+        for (i, name, pieces, note, labs) in (sh['report'] or []):
+            report.append((i + off, name, pieces, '[%s] %s' % (sh['name'], note), labs))
+    model = dict(chain[0]['model'])
+    model['legs'] = legs
+    model['outlets'] = outlets
+    model['outlets_found'] = sum(sh['model'].get('outlets_found', 0) for sh in chain)
+    model.pop('outlet_report', None)
+    model.pop('process', None)
+    model['sheets'] = [sh['name'] for sh in chain]
+    lines = []
+    for sh in chain:
+        ln = sh['model'].get('line_number') or ''
+        if ln not in lines:
+            lines.append(ln)
+    model['line_numbers'] = lines
+    if outlets and not model.get('outlet_nps'):
+        model['outlet_nps'], model['outlet_schedule'] = outlets[0]['nps'], outlets[0]['sch']
+    if not args.no_image:
+        for n_, sh in enumerate(chain, 1):
+            if sh.get('ctx'):
+                try:
+                    draw_check('%s_sheet%d.check.png' % (base, n_), sh['ctx'][1], sh['ctx'][0], sh['geo'],
+                               sh['model'], [])
+                except Exception as ex:
+                    warn('Could not write the check picture of %s: %s' % (sh['name'], ex))
+    end_expected = None if chain[-1].get('reversed') else chain[-1].get('end')
+    return model, report, end_expected
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description='Isometric PDF -> CAESAR II neutral file (no AI, offline).')
-    ap.add_argument('pdf', nargs='?', help='isometric drawing (vector PDF)')
+    ap.add_argument('pdf', nargs='*', help='isometric drawing(s) (vector PDF). Several sheets of one line are joined into one file')
     ap.add_argument('-o', '--out', help='output .CII (default: next to the PDF)')
     ap.add_argument('--page', type=int, default=0, help='page number, starting at 0')
     ap.add_argument('--north', choices=list(NORTH_OPTIONS), default='up-left',
@@ -2445,20 +2680,31 @@ def main(argv=None):
     def log(m):
         print(m)
 
-    if not args.pdf and not args.from_json:
+    pdfs = []
+    for p_ in (args.pdf or []):
+        if os.path.isdir(p_):
+            pdfs += sorted(os.path.join(p_, f_) for f_ in os.listdir(p_) if f_.lower().endswith('.pdf'))
+        else:
+            pdfs.append(p_)
+    if not pdfs and not args.from_json:
         try:
             import tkinter as tk
             from tkinter import filedialog
-            r = tk.Tk(); r.withdraw()
-            args.pdf = filedialog.askopenfilename(title='Choose the isometric PDF', filetypes=[('PDF', '*.pdf')])
-            if not args.pdf:
+            r = tk.Tk(); r.withdraw(); r.attributes('-topmost', True)
+            pdfs = list(filedialog.askopenfilenames(
+                title='Choose the isometric PDF(s). Choose all sheets of a line together to get ONE file.',
+                filetypes=[('PDF', '*.pdf')]))
+            r.destroy()
+            if not pdfs:
                 return 1
         except Exception:
             ap.print_help()
             return 1
+    pdfs.sort(key=lambda q: (sheet_key(q)[0], sheet_key(q)[1]))
+    args.pdf = pdfs[0] if pdfs else None
 
     parent = None
-    if args.pdf and not args.from_json and not args.out_dir and not args.no_ask:
+    if pdfs and not args.from_json and not args.out_dir and not args.no_ask:
         parent = ask_save_location(os.path.dirname(os.path.abspath(args.pdf)))
         if not parent:
             print('Cancelled. Nothing was saved.')
@@ -2467,104 +2713,168 @@ def main(argv=None):
 
     dbp = choose_db(args, warn, log)
 
-    try:
-        if args.from_json:
-            with open(args.from_json, encoding='utf-8') as f:
-                model = json.load(f)
-            model.pop('_report', None)
-            base = os.path.splitext(args.from_json)[0].replace('.review', '')
-            legs_geo = page_ctx = end_expected = None
-            report = None
-        else:
-            model, report, legs_geo, page_ctx, end_expected = analyse_pdf(args, log, warn)
-            name = os.path.splitext(os.path.basename(args.pdf))[0]
-            folder = args.out_dir or os.path.join(parent or os.path.dirname(os.path.abspath(args.pdf)), name)
-            os.makedirs(folder, exist_ok=True)          # one folder per drawing, named like the PDF
-            base = os.path.join(folder, name)
-        out_path = args.out or (base + '.CII')
-        bad = [i + 1 for i, l in enumerate(model['legs'])
-               if (l.get('comp') and any(float(v) <= 0 for _, v in l['comp'])) or
-               (not l.get('comp') and (not l['parts'] or any(float(p) <= 0 for p in l['parts'])))]
-        if bad:
-            if args.from_json:
-                raise ConvertError('Leg(s) %s have no valid "parts" in the review file. Fill them in and run again.' % bad)
-            with open(base + '.review.json', 'w', encoding='utf-8') as f:
-                json.dump(model, f, indent=2)
-            if not args.no_image and page_ctx:
-                try:
-                    draw_check(base + '.check.png', page_ctx[1], page_ctx[0], legs_geo, model, [])
-                except Exception as ex:
-                    warn('Could not write the check picture: %s' % ex)
-            print('\nThe route was found, but leg(s) %s could not be read completely, so NO .CII was written.' % bad)
-            print('  1. Open %s.review.json and fill in the "parts" of those legs (lengths in mm, in order).' % os.path.basename(base))
-            print('  2. Run:  python iso2cii.py --from-json "%s.review.json"' % base)
-            print('  The picture %s.check.png shows the route and marks the legs that were not read.' % os.path.basename(base))
-            return 3
-        if dbp:
-            recs = load_process_db(dbp, args.temp_unit, args.press_unit, warn, log)
-            found = lookup_process(recs, model.get('line_number'), warn)
-            if found:
-                model['process'] = found
-        text, elems, table, od, wall, R = build_cii(model, args.z_is_north, warn)
-        if model.get('outlets_found') and not model.get('outlet_report') and not getattr(args, 'ignore_branches', False):
-            raise ConvertError('This sheet has %d branch outlets but none of them could be placed from the OPEN END '
-                               'notes, so the result would be wrong. Use --ignore-branches to convert only the main run.'
-                               % model['outlets_found'])
-        with open(out_path, 'w', newline='', encoding='latin-1', errors='replace') as f:
-            f.write(text)
-        if not args.from_json:
-            with open(base + '.review.json', 'w', encoding='utf-8') as f:
-                json.dump(model, f, indent=2)
-            if not args.no_image and page_ctx:
-                try:
-                    draw_check(base + '.check.png', page_ctx[1], page_ctx[0], legs_geo, model, elems)
-                except Exception as ex:
-                    warn('Could not write the check picture: %s' % ex)
-        print()
-        print('Line number : %s' % (model.get('line_number') or '(none)'))
-        if model.get('process'):
-            pr = model['process']
-            print('Process     : Excel line "%s"  T1..T9 = %s C   P1..P9 = %s kPa' % (
-                pr['excel_line'], [round(v, 1) for v in pr['temps']], [round(v, 1) for v in pr['press']]))
-        elif dbp:
-            print('Process     : NOT filled (see the warning above)')
-        print('Pipe        : OD %.2f mm, wall %.2f mm (schedule %s), bend radius %.1f mm' % (od, wall, model.get('schedule', '?'), R))
-        if report:
-            print('\nLegs read from the drawing:')
-            for i, name, pieces, note, labs in report:
-                print('  leg %d  %s  %-40s  total %-6d [%s]  (labels: %s)' % (
-                    i, name, ' + '.join(str(int(p)) for p in pieces), sum(pieces), note, labs))
-        print('\nNodes (E, elevation, Z in mm):')
-        for nd, x, y, z in table:
-            print('  %4d  %12.1f %12.1f %12.1f' % (nd, x, y, z))
-        if model.get('outlet_report'):
-            print('\nOutlets (branch pipes %s" sch %s, %d of them), direction, length mm, from node:' % (
-                fmt_num(model.get('outlet_nps')), model.get('outlet_schedule'), len(model['outlet_report'])))
-            for dname, Lv, hn in model['outlet_report']:
-                print('  %s  %7.1f  node %d' % (dname, Lv, hn))
-            print('  (Outlets are plain pipe elements. Add the tee / branch SIF in CAESAR II.)')
-        if end_expected:
-            closure_check(model, table, end_expected, args.z_is_north, warn, log)
-        print('\n%d elements, %d bends written to %s' % (len(elems), sum(e['bend'] for e in elems), out_path))
-        if warnings:
-            print('\n%d warning(s) above. Check them before you import.' % len(warnings))
-        print('Results folder: %s' % os.path.dirname(os.path.abspath(out_path)))
-        print('Next: compare %s.check.png with the drawing, then import the .CII in CAESAR II.' % os.path.basename(base))
-        return 0
-    except ConvertError as ex:
-        print('\nERROR: %s' % ex)
-        return 2
-    except Exception as ex:                     # anything unexpected: say it plainly, keep the details for me
-        import traceback
-        tb = traceback.format_exc()
-        print('\nUNEXPECTED ERROR: %s: %s' % (type(ex).__name__, ex))
+    def convert(item):
+        warnings.clear()
         try:
-            with open('iso2cii_error.txt', 'w', encoding='utf-8') as f:
-                f.write(tb)
-            print('Details were saved in iso2cii_error.txt (send this file if you ask for help).')
-        except Exception:
-            print(tb)
-        return 4
+            if args.from_json:
+                with open(args.from_json, encoding='utf-8') as f:
+                    model = json.load(f)
+                model.pop('_report', None)
+                base = os.path.splitext(args.from_json)[0].replace('.review', '')
+                legs_geo = page_ctx = end_expected = None
+                report = None
+            else:
+                base, model, report, legs_geo, page_ctx, end_expected = (
+                    item['base'], item['model'], item['report'], item['geo'], item['ctx'], item['end'])
+            out_path = args.out or (base + '.CII')
+            bad = [i + 1 for i, l in enumerate(model['legs'])
+                   if (l.get('comp') and any(float(v) <= 0 for _, v in l['comp'])) or
+                   (not l.get('comp') and (not l['parts'] or any(float(p) <= 0 for p in l['parts'])))]
+            if bad:
+                if args.from_json:
+                    raise ConvertError('Leg(s) %s have no valid "parts" in the review file. Fill them in and run again.' % bad)
+                with open(base + '.review.json', 'w', encoding='utf-8') as f:
+                    json.dump(model, f, indent=2)
+                if not args.no_image and page_ctx:
+                    try:
+                        draw_check(base + '.check.png', page_ctx[1], page_ctx[0], legs_geo, model, [])
+                    except Exception as ex:
+                        warn('Could not write the check picture: %s' % ex)
+                print('\nThe route was found, but leg(s) %s could not be read completely, so NO .CII was written.' % bad)
+                print('  1. Open %s.review.json and fill in the "parts" of those legs (lengths in mm, in order).' % os.path.basename(base))
+                print('  2. Run:  python iso2cii.py --from-json "%s.review.json"' % base)
+                print('  The picture %s.check.png shows the route and marks the legs that were not read.' % os.path.basename(base))
+                return 3
+            if dbp:
+                recs = load_process_db(dbp, args.temp_unit, args.press_unit, warn, log)
+                if model.get('sheets'):          # merged lines: each leg gets the data of its own line number
+                    cache_ = {}
+                    for lg_ in model['legs']:
+                        ln_ = lg_.get('ln')
+                        if ln_ is None:
+                            continue
+                        if ln_ not in cache_:
+                            cache_[ln_] = lookup_process(recs, ln_, warn)
+                        if cache_[ln_]:
+                            lg_['process'] = cache_[ln_]
+                    model['process_by_line'] = {k_: v_ for k_, v_ in cache_.items() if v_}
+                else:
+                    found = lookup_process(recs, model.get('line_number'), warn)
+                    if found:
+                        model['process'] = found
+            text, elems, table, od, wall, R = build_cii(model, args.z_is_north, warn)
+            if model.get('outlets_found') and not model.get('outlet_report') and not getattr(args, 'ignore_branches', False):
+                raise ConvertError('This sheet has %d branch outlets but none of them could be placed from the OPEN END '
+                                   'notes, so the result would be wrong. Use --ignore-branches to convert only the main run.'
+                                   % model['outlets_found'])
+            with open(out_path, 'w', newline='', encoding='latin-1', errors='replace') as f:
+                f.write(text)
+            if not args.from_json:
+                with open(base + '.review.json', 'w', encoding='utf-8') as f:
+                    json.dump(model, f, indent=2)
+                if not args.no_image and page_ctx:
+                    try:
+                        draw_check(base + '.check.png', page_ctx[1], page_ctx[0], legs_geo, model, elems)
+                    except Exception as ex:
+                        warn('Could not write the check picture: %s' % ex)
+            print()
+            print('Line number : %s' % ((' , '.join(model['line_numbers'])) if model.get('line_numbers') else (model.get('line_number') or '(none)')))
+            if model.get('process'):
+                pr = model['process']
+                print('Process     : Excel line "%s"  T1..T9 = %s C   P1..P9 = %s kPa' % (
+                    pr['excel_line'], [round(v, 1) for v in pr['temps']], [round(v, 1) for v in pr['press']]))
+            elif model.get('process_by_line'):
+                for ln_, pr in model['process_by_line'].items():
+                    print('Process     : %s -> Excel line "%s"  T1 %s C  P1 %s kPa' % (
+                        ln_, pr['excel_line'], round(pr['temps'][0], 1), round(pr['press'][0], 1)))
+            elif dbp:
+                print('Process     : NOT filled (see the warning above)')
+            print('Pipe        : OD %.2f mm, wall %.2f mm (schedule %s), bend radius %.1f mm' % (od, wall, model.get('schedule', '?'), R))
+            if report:
+                print('\nLegs read from the drawing:')
+                for i, name, pieces, note, labs in report:
+                    print('  leg %d  %s  %-40s  total %-6d [%s]  (labels: %s)' % (
+                        i, name, ' + '.join(str(int(p)) for p in pieces), sum(pieces), note, labs))
+            print('\nNodes (E, elevation, Z in mm):')
+            for nd, x, y, z in table:
+                print('  %4d  %12.1f %12.1f %12.1f' % (nd, x, y, z))
+            if model.get('outlet_report'):
+                print('\nOutlets (branch pipes %s" sch %s, %d of them), direction, length mm, from node:' % (
+                    fmt_num(model.get('outlet_nps')), model.get('outlet_schedule'), len(model['outlet_report'])))
+                for dname, Lv, hn in model['outlet_report']:
+                    print('  %s  %7.1f  node %d' % (dname, Lv, hn))
+                print('  (Outlets are plain pipe elements. Add the tee / branch SIF in CAESAR II.)')
+            if end_expected:
+                closure_check(model, table, end_expected, args.z_is_north, warn, log)
+            print('\n%d elements, %d bends written to %s' % (len(elems), sum(e['bend'] for e in elems), out_path))
+            if warnings:
+                print('\n%d warning(s) above. Check them before you import.' % len(warnings))
+            print('Results folder: %s' % os.path.dirname(os.path.abspath(out_path)))
+            if model.get('sheets'):
+                print('Next: compare the %s_sheet*.check.png pictures with the drawings, then import the .CII in CAESAR II.' % os.path.basename(base))
+            else:
+                print('Next: compare %s.check.png with the drawing, then import the .CII in CAESAR II.' % os.path.basename(base))
+            return 0
+        except ConvertError as ex:
+            print('\nERROR: %s' % ex)
+            return 2
+        except Exception as ex:                     # anything unexpected: say it plainly, keep the details for me
+            import traceback
+            tb = traceback.format_exc()
+            print('\nUNEXPECTED ERROR: %s: %s' % (type(ex).__name__, ex))
+            try:
+                with open('iso2cii_error.txt', 'w', encoding='utf-8') as f:
+                    f.write(tb)
+                print('Details were saved in iso2cii_error.txt (send this file if you ask for help).')
+            except Exception:
+                print(tb)
+            return 4
+
+
+    if args.from_json:
+        return convert(None)
+    sheets = read_sheets(args, pdfs, log, warn)
+    rc = 0
+    for sh in sheets:
+        if 'error' in sh:
+            print('\nERROR%s: %s' % ((' (%s)' % sh['name']) if len(pdfs) > 1 else '', sh['error']))
+            if len(pdfs) > 1 and 'No pipe drawing found' in sh['error']:
+                continue                     # a bill-of-materials sheet in a multi-file run is not a failure
+            rc = 2
+    chains = chain_sheets(sheets, args.z_is_north, log, warn) if len(pdfs) > 1 else [[s_] for s_ in sheets if 'model' in s_ and not s_['bad']]
+    for sh in sheets:
+        if 'model' in sh and sh['bad']:        # unread legs: the existing review-file route, one sheet at a time
+            chains.append([sh])
+    if not chains:
+        return rc or 2
+    for ch in chains:
+        if len(ch) == 1:
+            sh = ch[0]
+            name = os.path.splitext(os.path.basename(sh['pdf']))[0]
+            folder = args.out_dir or os.path.join(parent or os.path.dirname(os.path.abspath(sh['pdf'])), name)
+            os.makedirs(folder, exist_ok=True)          # one folder per drawing, named like the PDF
+            item = {'base': os.path.join(folder, name), 'model': sh['model'], 'report': sh['report'],
+                    'geo': sh['geo'], 'ctx': sh['ctx'], 'end': sh['end']}
+        else:
+            keys = []
+            for sh in ch:
+                k_ = sheet_key(sh['pdf'])[0]
+                if k_ not in keys:
+                    keys.append(k_)
+            name = '+'.join(keys)[:90] + '_merged'
+            folder = args.out_dir or os.path.join(parent or os.path.dirname(os.path.abspath(ch[0]['pdf'])), name)
+            os.makedirs(folder, exist_ok=True)
+            base = os.path.join(folder, name)
+            print('\n################ %s (%d sheets) ################' % (name, len(ch)))
+            try:
+                model, report, end_expected = merge_chain(args, ch, base, log, warn)
+            except ConvertError as ex:
+                print('\nERROR: %s' % ex)
+                rc = 2
+                continue
+            item = {'base': base, 'model': model, 'report': report, 'geo': None, 'ctx': None, 'end': end_expected}
+        rc = convert(item) or rc
+    return rc
 
 
 if __name__ == '__main__':
