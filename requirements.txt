@@ -8,6 +8,8 @@ rapidocr-onnxruntime>=1.2.3
 # image handling for the OCR crops and the check picture
 pillow>=10.0
 numpy>=1.24
+# picture-based fallback when a PDF has no usable line widths (rapidocr also brings it)
+opencv-python>=4.8
 # reads the Excel line list (temperature and pressure)
 openpyxl>=3.1
 
